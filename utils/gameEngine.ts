@@ -49,9 +49,16 @@ export type ComboEntry = {
 };
 
 export type GamePhase = "idle" | "dueling" | "victory" | "defeat";
+export type GameMode = "solo" | "multiplayer" | "training";
+
+export type DuelNames = {
+  playerName?: string;
+  opponentName?: string;
+};
 
 export type GameState = {
   phase: GamePhase;
+  mode: GameMode;
   player: FighterState;
   opponent: FighterState;
   cooldowns: CooldownMap;
@@ -119,9 +126,10 @@ export class GameEngine {
     return () => this.listeners.delete(listener);
   }
 
-  startDuel(): void {
-    this.state = this.buildInitialState();
+  startDuel(mode: GameMode = "solo", names?: DuelNames): void {
+    this.state = this.buildInitialState(names);
     this.state.phase = "dueling";
+    this.state.mode = mode;
     this.startDotTimer();
     this.emit({ type: "state_change", state: this.state });
   }
@@ -177,9 +185,23 @@ export class GameEngine {
     );
     this.state = { ...this.state, score: this.state.score + points };
 
-    // Trigger AI response
-    this.scheduleAiResponse();
+    // Trigger AI response only in solo mode.
+    if (this.state.mode === "solo") {
+      this.scheduleAiResponse();
+    }
 
+    this.emit({ type: "state_change", state: this.state });
+    return true;
+  }
+
+  castOpponentSpell(spellId: SpellId): boolean {
+    if (this.state.phase !== "dueling") return false;
+
+    const spell = SPELL_REGISTRY[spellId];
+    if (!spell) return false;
+
+    this.emit({ type: "opponent_cast", spellId });
+    this.applySpellEffect(spell, "player");
     this.emit({ type: "state_change", state: this.state });
     return true;
   }
@@ -203,22 +225,26 @@ export class GameEngine {
 
   // ── Private helpers ────────────────────────────────────────────────────────
 
-  private buildInitialState(): GameState {
+  private buildInitialState(names?: DuelNames): GameState {
+    const playerName = names?.playerName ?? "You";
+    const opponentName = names?.opponentName ?? "Dark Wizard";
+
     return {
       phase: "idle",
+      mode: "solo",
       player: {
         hp: PLAYER_MAX_HP,
         maxHp: PLAYER_MAX_HP,
         shieldStrength: 0,
         effects: [],
-        name: "You",
+        name: playerName,
       },
       opponent: {
         hp: OPPONENT_MAX_HP,
         maxHp: OPPONENT_MAX_HP,
         shieldStrength: 0,
         effects: [],
-        name: "Dark Wizard",
+        name: opponentName,
       },
       cooldowns: {},
       combo: [],

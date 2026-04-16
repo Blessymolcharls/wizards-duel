@@ -15,9 +15,10 @@ import {
   type Point,
 } from "@/utils/gestureUtils";
 import { segmentPath, type MotionSegment } from "@/utils/motionGesture";
-import { getGameEngine, type GameState, type EngineEvent } from "@/utils/gameEngine";
+import { getGameEngine, type GameState, type EngineEvent, type GameMode } from "@/utils/gameEngine";
 import type { SpellDefinition } from "@/utils/spellRegistry";
 import { getAllSpells } from "@/utils/spellRegistry";
+import { useDuelWebRTC } from "@/hooks/useDuelWebRTC";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -35,6 +36,15 @@ type ToastMessage = {
   at: number;
 };
 
+type HandTrackerProps = {
+  mode?: Exclude<GameMode, "multiplayer">;
+  multiplayer?: {
+    enabled: boolean;
+    role: "host" | "guest";
+    roomId: string;
+  };
+};
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const DEFAULT_TRACKING: TrackingSettings = {
@@ -47,6 +57,12 @@ const DEFAULT_TRACKING: TrackingSettings = {
 const SPELL_TOAST_TTL = 2800;
 const FEEDBACK_TTL = 2600;
 const FLASH_DECAY_MS = 800;
+
+const mapHostStateToGuestView = (hostState: GameState): GameState => ({
+  ...hostState,
+  player: { ...hostState.opponent },
+  opponent: { ...hostState.player },
+});
 
 // ─── Audio ────────────────────────────────────────────────────────────────────
 
@@ -78,7 +94,7 @@ function playSpellTone(
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
-export function HandTracker() {
+export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
   // ── Refs ────────────────────────────────────────────────────────────────────
   const recognizerRef = useRef(new MotionRecognizer());
   const engineRef = useRef(getGameEngine());
@@ -88,16 +104,49 @@ export function HandTracker() {
   const lastObservedTimeRef = useRef<number | null>(null);
   const lastMovementAtRef = useRef<number>(0);
   const dropoutStartRef = useRef<number | null>(null);
+  const sendCastRef = useRef<(spellId: string) => boolean>(() => false);
+  const sendStateSyncRef = useRef<(state: unknown) => boolean>(() => false);
+  const localPreviewRef = useRef<HTMLVideoElement | null>(null);
+  const remotePreviewRef = useRef<HTMLVideoElement | null>(null);
 
   // ── State ───────────────────────────────────────────────────────────────────
   const [trail, setTrail] = useState<Point[]>([]);
   const [segments, setSegments] = useState<MotionSegment[]>([]);
   const [feedback, setFeedback] = useState<CastFeedback | null>(null);
   const [flashProgress, setFlashProgress] = useState(0);
-  const [gameState, setGameState] = useState<GameState>(engineRef.current.getState());
+  const [gameState, setGameState] = useState<GameState>(() => getGameEngine().getState());
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [showDebug, setShowDebug] = useState(false);
   const [opponentCastFeedback, setOpponentCastFeedback] = useState<SpellDefinition | null>(null);
+  const [clockMs, setClockMs] = useState(() => Date.now());
+
+  const multiplayerEnabled = Boolean(multiplayer?.enabled);
+  const duelMode: GameMode = multiplayerEnabled ? "multiplayer" : mode;
+  const role = multiplayer?.role ?? "guest";
+  const roomId = multiplayer?.roomId ?? "";
+
+  // ── Toast helper ─────────────────────────────────────────────────────────
+  const addToast = useCallback((text: string, color: string) => {
+    const id = `${Date.now()}_${Math.random()}`;
+    setToasts((prev) => [...prev.slice(-4), { id, text, color, at: Date.now() }]);
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, SPELL_TOAST_TTL);
+  }, []);
+
+  // ── Clear handler ────────────────────────────────────────────────────────
+  const handleClear = useCallback(() => {
+    setTrail([]);
+    trailRef.current = [];
+    recognizerRef.current.clearTrail();
+    setSegments([]);
+    velocityRef.current = { x: 0, y: 0 };
+    lastObservedPointRef.current = null;
+    lastObservedTimeRef.current = null;
+    dropoutStartRef.current = null;
+    setFeedback(null);
+    setFlashProgress(0);
+  }, []);
 
   // ── Game engine subscription ─────────────────────────────────────────────
   useEffect(() => {
@@ -106,19 +155,13 @@ export function HandTracker() {
     const unsub = engine.subscribe((event: EngineEvent) => {
       if (event.type === "state_change") {
         setGameState({ ...event.state });
+        if (multiplayerEnabled && role === "host") {
+          sendStateSyncRef.current(event.state);
+        }
       }
 
       if (event.type === "spell_cast") {
         // handled in handleTrackingFrame
-      }
-
-      if (event.type === "opponent_cast") {
-        const spellDef = getAllSpells().find((s: SpellDefinition) => s.id === event.spellId);
-        if (spellDef) {
-          setOpponentCastFeedback(spellDef);
-          addToast(`⚔️ ${spellDef.displayName}!`, spellDef.color);
-          setTimeout(() => setOpponentCastFeedback(null), 2000);
-        }
       }
 
       if (event.type === "combo") {
@@ -134,14 +177,15 @@ export function HandTracker() {
     });
 
     return unsub;
-  }, []);
+  }, [addToast, multiplayerEnabled, role]);
 
-  // ── Auto-start duel on mount ─────────────────────────────────────────────
   useEffect(() => {
-    const engine = engineRef.current;
-    if (engine.getState().phase === "idle") {
-      setTimeout(() => engine.startDuel(), 1200);
-    }
+    const timer = window.setInterval(() => {
+      setClockMs(Date.now());
+    }, 500);
+    return () => {
+      window.clearInterval(timer);
+    };
   }, []);
 
   // ── Flash animation ──────────────────────────────────────────────────────
@@ -158,15 +202,6 @@ export function HandTracker() {
     frame = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(frame);
   }, [feedback]);
-
-  // ── Toast helper ─────────────────────────────────────────────────────────
-  const addToast = useCallback((text: string, color: string) => {
-    const id = `${Date.now()}_${Math.random()}`;
-    setToasts((prev) => [...prev.slice(-4), { id, text, color, at: Date.now() }]);
-    setTimeout(() => {
-      setToasts((prev) => prev.filter((t) => t.id !== id));
-    }, SPELL_TOAST_TTL);
-  }, []);
 
   // ── Tracking frame handler ───────────────────────────────────────────────
   const handleTrackingFrame = useCallback(
@@ -278,6 +313,9 @@ export function HandTracker() {
           recognizer.clearTrail();
           playSpellTone(spell.soundFrequencies, spell.soundWave);
           addToast(`✨ ${spell.displayName}`, spell.color);
+          if (multiplayerEnabled) {
+            sendCastRef.current(spell.id);
+          }
         }
       }
 
@@ -292,11 +330,11 @@ export function HandTracker() {
         setSegments([]);
       }
     },
-    [addToast],
+    [addToast, multiplayerEnabled],
   );
 
   // ── Tracking hook ────────────────────────────────────────────────────────
-  const { videoRef, landmarks, gesture, fps, isReady, error, videoSize } =
+  const { videoRef, landmarks, cameraStream, gesture, fps, isReady, error, videoSize } =
     useHandTracking(DEFAULT_TRACKING, handleTrackingFrame);
 
   // ── Render path ──────────────────────────────────────────────────────────
@@ -307,19 +345,106 @@ export function HandTracker() {
 
   const activeSpellColor = feedback?.spell.color ?? null;
 
-  // ── Clear handler ────────────────────────────────────────────────────────
-  const handleClear = useCallback(() => {
-    setTrail([]);
-    trailRef.current = [];
-    recognizerRef.current.clearTrail();
-    setSegments([]);
-    velocityRef.current = { x: 0, y: 0 };
-    lastObservedPointRef.current = null;
-    lastObservedTimeRef.current = null;
-    dropoutStartRef.current = null;
-    setFeedback(null);
-    setFlashProgress(0);
-  }, []);
+  const {
+    status: peerStatus,
+    error: peerError,
+    hostPresent,
+    guestPresent,
+    inviteUrl,
+    sendCast,
+    sendRestart,
+    sendStateSync,
+    localAlias,
+    remoteAlias,
+    remoteStream,
+    isConnected,
+  } = useDuelWebRTC({
+    enabled: multiplayerEnabled,
+    role,
+    roomId,
+    localStream: cameraStream,
+    onPeerCast: (spellId) => {
+      const applied = engineRef.current.castOpponentSpell(spellId);
+      if (!applied) {
+        return;
+      }
+      const spellDef = getAllSpells().find((s) => s.id === spellId);
+      if (spellDef) {
+        setOpponentCastFeedback(spellDef);
+        addToast(`⚔️ ${spellDef.displayName}!`, spellDef.color);
+        setTimeout(() => setOpponentCastFeedback(null), 2000);
+      }
+    },
+    onPeerRestart: () => {
+      if (multiplayerEnabled) {
+        engineRef.current.startDuel("multiplayer", {
+          playerName: localAlias,
+          opponentName: remoteAlias,
+        });
+      } else {
+        engineRef.current.startDuel(duelMode);
+      }
+      handleClear();
+      addToast("Duel restarted by opponent.", "#9ad9ff");
+    },
+    onPeerStateSync: (statePayload) => {
+      if (role !== "guest") {
+        return;
+      }
+
+      const next = statePayload as GameState;
+      if (!next || typeof next !== "object" || !next.player || !next.opponent) {
+        return;
+      }
+
+      setGameState(mapHostStateToGuestView(next));
+    },
+  });
+
+  useEffect(() => {
+    sendCastRef.current = sendCast as (spellId: string) => boolean;
+  }, [sendCast]);
+
+  useEffect(() => {
+    sendStateSyncRef.current = sendStateSync as (state: unknown) => boolean;
+  }, [sendStateSync]);
+
+  // ── Auto-start duel on mount ─────────────────────────────────────────────
+  useEffect(() => {
+    const engine = engineRef.current;
+    if (engine.getState().phase === "idle") {
+      setTimeout(() => {
+        if (multiplayerEnabled) {
+          engine.startDuel("multiplayer", {
+            playerName: localAlias,
+            opponentName: remoteAlias,
+          });
+        } else {
+          engine.startDuel(duelMode);
+        }
+      }, 1200);
+    }
+  }, [duelMode, localAlias, multiplayerEnabled, remoteAlias]);
+
+  useEffect(() => {
+    const localPreview = localPreviewRef.current;
+    if (localPreview && cameraStream) {
+      localPreview.srcObject = cameraStream;
+      void localPreview.play().catch(() => {
+        // no-op
+      });
+    }
+  }, [cameraStream]);
+
+  useEffect(() => {
+    const remotePreview = remotePreviewRef.current;
+    if (remotePreview && remoteStream) {
+      remotePreview.srcObject = remoteStream;
+      void remotePreview.play().catch(() => {
+        // no-op
+      });
+    }
+  }, [remoteStream]);
 
   return (
     <div className="duel-root">
@@ -407,7 +532,17 @@ export function HandTracker() {
               <button
                 type="button"
                 onClick={() => {
-                  engineRef.current.startDuel();
+                  if (multiplayerEnabled) {
+                    engineRef.current.startDuel("multiplayer", {
+                      playerName: localAlias,
+                      opponentName: remoteAlias,
+                    });
+                  } else {
+                    engineRef.current.startDuel(duelMode);
+                  }
+                  if (multiplayerEnabled) {
+                    void sendRestart();
+                  }
                   handleClear();
                 }}
                 className="btn-restart"
@@ -422,21 +557,79 @@ export function HandTracker() {
       {/* ── Right panel ─────────────────────────────────────────────────── */}
       <aside className="side-panel">
         <header className="panel-header">
-          <h1 className="duel-title">Wizard's Duel</h1>
+          <h1 className="duel-title">Wizard&apos;s Duel</h1>
           <p className="duel-subtitle">Motion Recognition Engine</p>
+          {multiplayerEnabled && (
+            <div className="mt-2">
+              <p className="duel-subtitle">Room {roomId.toUpperCase()} • {role.toUpperCase()}</p>
+              <p className="duel-subtitle">Peer: {peerStatus.toUpperCase()}</p>
+              <p className="duel-subtitle">You: {localAlias}</p>
+              <p className="duel-subtitle">Opponent: {remoteAlias}</p>
+              {role === "host" && !guestPresent && (
+                <p className="duel-subtitle">Waiting for guest to join...</p>
+              )}
+              {role === "guest" && !hostPresent && (
+                <p className="duel-subtitle">Waiting for host...</p>
+              )}
+              {role === "host" && inviteUrl && (
+                <p className="duel-subtitle" style={{ textTransform: "none", letterSpacing: "0.04em" }}>
+                  Share link: {inviteUrl}
+                </p>
+              )}
+              {peerError && (
+                <p className="duel-subtitle" style={{ color: "#ff7d7d" }}>
+                  {peerError}
+                </p>
+              )}
+              {isConnected && (
+                <p className="duel-subtitle" style={{ color: "#83ffc9" }}>
+                  Connected
+                </p>
+              )}
+            </div>
+          )}
+
+          {multiplayerEnabled && (
+            <div className="camera-duel-grid">
+              <div className="camera-duel-card">
+                <p className="camera-duel-label">Your wand cam</p>
+                <video
+                  ref={localPreviewRef}
+                  autoPlay
+                  muted
+                  playsInline
+                  className="camera-duel-video"
+                  style={{ transform: "scaleX(-1)" }}
+                />
+              </div>
+              <div className="camera-duel-card">
+                <p className="camera-duel-label">Opponent cam</p>
+                {remoteStream ? (
+                  <video
+                    ref={remotePreviewRef}
+                    autoPlay
+                    playsInline
+                    className="camera-duel-video"
+                  />
+                ) : (
+                  <div className="camera-duel-empty">Waiting for opponent stream...</div>
+                )}
+              </div>
+            </div>
+          )}
         </header>
 
         {/* Health bars */}
         <HealthBars gameState={gameState} />
 
         {/* Combo meter */}
-        <ComboMeter gameState={gameState} />
+        <ComboMeter gameState={gameState} now={clockMs} />
 
         {/* Spell Grid */}
-        <SpellGrid gameState={gameState} currentFeedback={feedback} />
+        <SpellGrid gameState={gameState} currentFeedback={feedback} now={clockMs} />
 
         {/* Active effects */}
-        <EffectList gameState={gameState} />
+        <EffectList gameState={gameState} now={clockMs} />
       </aside>
 
       {/* ── Toast notifications ── */}
@@ -512,9 +705,9 @@ function HealthBars({ gameState }: { gameState: GameState }) {
   );
 }
 
-function ComboMeter({ gameState }: { gameState: GameState }) {
+function ComboMeter({ gameState, now }: { gameState: GameState; now: number }) {
   const recent = gameState.combo.filter(
-    (c) => Date.now() - c.castedAt < 3500,
+    (c) => now - c.castedAt < 3500,
   );
   const count = recent.length;
   if (count < 2) return null;
@@ -533,12 +726,13 @@ function ComboMeter({ gameState }: { gameState: GameState }) {
 function SpellGrid({
   gameState,
   currentFeedback,
+  now,
 }: {
   gameState: GameState;
   currentFeedback: CastFeedback | null;
+  now: number;
 }) {
   const allSpells = getAllSpells();
-  const now = Date.now();
 
   return (
     <div className="spell-grid-wrap">
@@ -577,8 +771,7 @@ function SpellGrid({
   );
 }
 
-function EffectList({ gameState }: { gameState: GameState }) {
-  const now = Date.now();
+function EffectList({ gameState, now }: { gameState: GameState; now: number }) {
   const allEffects = [
     ...gameState.player.effects.map((e) => ({ ...e, target: "You" })),
     ...gameState.opponent.effects.map((e) => ({ ...e, target: "Opponent" })),

@@ -47,7 +47,46 @@ declare global {
 const MEDIAPIPE_HANDS_SCRIPT =
   "https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js";
 
+const CAPTURE_WIDTH = 640;
+const CAPTURE_HEIGHT = 360;
+const CAPTURE_FPS = 24;
+
 let handsScriptPromise: Promise<void> | null = null;
+
+const isInterruptedPlayError = (err: unknown): boolean => {
+  if (!(err instanceof Error)) {
+    return false;
+  }
+  const message = err.message.toLowerCase();
+  return (
+    message.includes("play() request was interrupted") ||
+    message.includes("interrupted by a new load request") ||
+    message.includes("aborterror")
+  );
+};
+
+const playVideoSafely = async (video: HTMLVideoElement): Promise<void> => {
+  try {
+    await video.play();
+    return;
+  } catch (err) {
+    if (!isInterruptedPlayError(err)) {
+      throw err;
+    }
+  }
+
+  await new Promise((resolve) => {
+    window.setTimeout(resolve, 80);
+  });
+
+  try {
+    await video.play();
+  } catch (err) {
+    if (!isInterruptedPlayError(err)) {
+      throw err;
+    }
+  }
+};
 
 const ensureHandsScript = async (): Promise<void> => {
   if (typeof window === "undefined") {
@@ -107,8 +146,9 @@ export const useHandTracking = (
   const [isReady, setIsReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [fps, setFps] = useState(0);
-  const [videoSize, setVideoSize] = useState({ width: 960, height: 540 });
+  const [videoSize, setVideoSize] = useState({ width: CAPTURE_WIDTH, height: CAPTURE_HEIGHT });
   const [landmarks, setLandmarks] = useState<NormalizedLandmark[] | null>(null);
+  const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
   const [gesture, setGesture] = useState<GestureState>({
     isActive: false,
     drawTip: null,
@@ -131,9 +171,11 @@ export const useHandTracking = (
         track.stop();
       }
       streamRef.current = null;
+      setCameraStream(null);
     }
 
     if (videoRef.current) {
+      videoRef.current.pause();
       videoRef.current.srcObject = null;
     }
   }, []);
@@ -155,9 +197,9 @@ export const useHandTracking = (
 
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
-          width: { ideal: 960 },
-          height: { ideal: 540 },
-          frameRate: { ideal: 60, min: 30 },
+          width: { ideal: CAPTURE_WIDTH, max: CAPTURE_WIDTH },
+          height: { ideal: CAPTURE_HEIGHT, max: CAPTURE_HEIGHT },
+          frameRate: { ideal: CAPTURE_FPS, max: CAPTURE_FPS },
           facingMode: "user",
         },
         audio: false,
@@ -169,12 +211,13 @@ export const useHandTracking = (
       }
 
       streamRef.current = stream;
+      setCameraStream(stream);
       video.srcObject = stream;
-      await video.play();
+      await playVideoSafely(video);
 
       setVideoSize({
-        width: video.videoWidth || 960,
-        height: video.videoHeight || 540,
+        width: video.videoWidth || CAPTURE_WIDTH,
+        height: video.videoHeight || CAPTURE_HEIGHT,
       });
 
       if (!handsRef.current) {
@@ -188,8 +231,8 @@ export const useHandTracking = (
           const tip = hand?.[8] ?? null;
 
           const currentVideoSize = {
-            width: video.videoWidth || 960,
-            height: video.videoHeight || 540,
+            width: video.videoWidth || CAPTURE_WIDTH,
+            height: video.videoHeight || CAPTURE_HEIGHT,
           };
 
           setVideoSize((prev) => {
@@ -305,6 +348,7 @@ export const useHandTracking = (
   return {
     videoRef,
     landmarks,
+    cameraStream,
     gesture,
     fps,
     isReady,
