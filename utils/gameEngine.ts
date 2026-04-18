@@ -21,6 +21,7 @@ import {
   type SpellDefinition,
   type SpellEffect,
 } from "./spellRegistry";
+import { calculateDamage } from "./damage";
 
 // ─── State types ──────────────────────────────────────────────────────────────
 
@@ -144,12 +145,12 @@ export class GameEngine {
    * Main entry point — called by the MotionRecognizer when a spell is detected.
    * Returns false if the spell is on cooldown or blocked by a status effect.
    */
-  castSpell(spellId: SpellId, confidence: number): boolean {
+  castSpell(spellId: SpellId, confidence: number, castedAt = Date.now()): boolean {
     if (this.state.phase !== "dueling") return false;
 
     // Check cooldown
     const readyAt = this.state.cooldowns[spellId] ?? 0;
-    if (Date.now() < readyAt) return false;
+    if (castedAt < readyAt) return false;
 
     // Check if player is stunned / frozen
     const isIncapacitated = this.state.player.effects.some(
@@ -167,19 +168,19 @@ export class GameEngine {
       ...this.state,
       cooldowns: {
         ...this.state.cooldowns,
-        [spellId]: Date.now() + spell.cooldownMs,
+        [spellId]: castedAt + spell.cooldownMs,
       },
       lastCastedSpell: spellId,
     };
 
     // Record combo
-    this.recordCombo(spellId);
+    this.recordCombo(spellId, castedAt);
 
     // Apply spell effect
-    this.applySpellEffect(spell, "opponent");
+    this.applySpellEffect(spell, "opponent", castedAt);
 
     // Score update
-    const comboMultiplier = this.getComboMultiplier();
+    const comboMultiplier = this.getComboMultiplier(castedAt);
     const points = Math.round(
       (spell.effect.damage + spell.effect.pushback * 0.3) * confidence * comboMultiplier,
     );
@@ -194,14 +195,14 @@ export class GameEngine {
     return true;
   }
 
-  castOpponentSpell(spellId: SpellId): boolean {
+  castOpponentSpell(spellId: SpellId, castedAt = Date.now()): boolean {
     if (this.state.phase !== "dueling") return false;
 
     const spell = SPELL_REGISTRY[spellId];
     if (!spell) return false;
 
     this.emit({ type: "opponent_cast", spellId });
-    this.applySpellEffect(spell, "player");
+    this.applySpellEffect(spell, "player", castedAt);
     this.emit({ type: "state_change", state: this.state });
     return true;
   }
@@ -257,6 +258,7 @@ export class GameEngine {
   private applySpellEffect(
     spell: SpellDefinition,
     target: "player" | "opponent",
+    appliedAt = Date.now(),
   ): void {
     const fighter = target === "player" ? "player" : "opponent";
     const { effect } = spell;
@@ -275,7 +277,7 @@ export class GameEngine {
     }
 
     // Absorb damage with shield
-    let damage = effect.damage;
+    let damage = calculateDamage(spell.id, effect.damage);
     if (damage > 0) {
       const targetFighter = this.state[fighter];
       if (targetFighter.shieldStrength > 0) {
@@ -305,10 +307,10 @@ export class GameEngine {
     // Status effect
     if (effect.status !== "none" && effect.durationMs > 0) {
       const activeEffect: ActiveEffect = {
-        id: `${spell.id}_${Date.now()}`,
+        id: `${spell.id}_${appliedAt}`,
         spellId: spell.id,
         status: effect.status,
-        startedAt: Date.now(),
+        startedAt: appliedAt,
         durationMs: effect.durationMs,
         tickDamage: effect.status === "bleeding" ? DOT_DAMAGE_PER_TICK : 0,
       };
@@ -328,22 +330,21 @@ export class GameEngine {
     this.checkGameOver();
   }
 
-  private recordCombo(spellId: SpellId): void {
-    const now = Date.now();
+  private recordCombo(spellId: SpellId, castedAt = Date.now()): void {
     const recentCombo = this.state.combo.filter(
-      (c) => now - c.castedAt <= COMBO_WINDOW_MS,
+      (c) => castedAt - c.castedAt <= COMBO_WINDOW_MS,
     );
-    const updated = [...recentCombo, { spellId, castedAt: now }];
+    const updated = [...recentCombo, { spellId, castedAt }];
     this.state = { ...this.state, combo: updated };
 
     if (updated.length >= 2) {
-      this.emit({ type: "combo", count: updated.length, multiplier: this.getComboMultiplier() });
+      this.emit({ type: "combo", count: updated.length, multiplier: this.getComboMultiplier(castedAt) });
     }
   }
 
-  private getComboMultiplier(): number {
+  private getComboMultiplier(referenceTime = Date.now()): number {
     const count = this.state.combo.filter(
-      (c) => Date.now() - c.castedAt <= COMBO_WINDOW_MS,
+      (c) => referenceTime - c.castedAt <= COMBO_WINDOW_MS,
     ).length;
     if (count < 2) return 1;
     if (count < 3) return 1.25;
@@ -426,7 +427,8 @@ export class GameEngine {
         // Tick DoT
         if (effect.tickDamage > 0) {
           const currentHp = this.state[target].hp;
-          const newHp = Math.max(0, currentHp - effect.tickDamage);
+          const tickDamage = calculateDamage(effect.spellId, effect.tickDamage);
+          const newHp = Math.max(0, currentHp - tickDamage);
           this.state = {
             ...this.state,
             [target]: { ...this.state[target], hp: newHp },
@@ -435,7 +437,7 @@ export class GameEngine {
             type: "spell_hit",
             spellId: effect.spellId,
             target,
-            damage: effect.tickDamage,
+            damage: tickDamage,
           });
           changed = true;
         }

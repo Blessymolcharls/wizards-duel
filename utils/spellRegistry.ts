@@ -368,8 +368,9 @@ function detectProtego(points: Point[]): number | null {
  */
 function detectProtegoMaxima(
   points: Point[],
-  _landmarks: LandmarkLike[],
+  landmarks: LandmarkLike[],
 ): number | null {
+  void landmarks;
   if (points.length < 15) return null;
 
   const duration = pathDurationMs(points);

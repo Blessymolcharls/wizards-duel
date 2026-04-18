@@ -98,9 +98,14 @@ export const resample = (points: Point[], n: number): Point[] => {
 
     while (distanceAccumulator + segment >= interval) {
       const ratio = (interval - distanceAccumulator) / segment;
+      const prevT = prev.t;
+      const currentT = current.t;
       const interpolated: Point = {
         x: prev.x + ratio * (current.x - prev.x),
         y: prev.y + ratio * (current.y - prev.y),
+        t: typeof prevT === "number" && typeof currentT === "number"
+          ? prevT + ratio * (currentT - prevT)
+          : current.t,
       };
 
       sampled.push(interpolated);
@@ -182,6 +187,48 @@ export const normalizePath = (points: Point[], resolution: number): Point[] => {
   const rotated = rotateBy(sampled, -angle);
   const scaled = scaleToUnitSquare(rotated);
   return translateToOrigin(scaled);
+};
+
+type GestureNormalizationOptions = {
+  resamplePoints?: number;
+  targetSize?: number;
+};
+
+export const normalizeGestureInput = (
+  points: Point[],
+  options: GestureNormalizationOptions = {},
+): Point[] => {
+  if (points.length === 0) {
+    return [];
+  }
+
+  const resamplePoints = Math.max(8, Math.floor(options.resamplePoints ?? 96));
+  const targetSize = Math.max(1, options.targetSize ?? 200);
+  const sampled = resample(points, resamplePoints);
+
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+
+  for (const point of sampled) {
+    minX = Math.min(minX, point.x);
+    minY = Math.min(minY, point.y);
+    maxX = Math.max(maxX, point.x);
+    maxY = Math.max(maxY, point.y);
+  }
+
+  const width = Math.max(1e-6, maxX - minX);
+  const height = Math.max(1e-6, maxY - minY);
+  const scale = targetSize / Math.max(width, height);
+  const centerX = (minX + maxX) * 0.5;
+  const centerY = (minY + maxY) * 0.5;
+
+  return sampled.map((point) => ({
+    x: (point.x - centerX) * scale,
+    y: (point.y - centerY) * scale,
+    t: point.t,
+  }));
 };
 
 export const pathDistance = (a: Point[], b: Point[]): number => {

@@ -19,15 +19,17 @@ import {
 import {
   distance,
   filterByMinDistance,
+  normalizeGestureInput,
   smoothPath,
   type Point,
 } from "@/utils/gestureUtils";
 import { segmentPath, type MotionSegment } from "@/utils/motionGesture";
 import { getGameEngine, type GameState, type EngineEvent, type GameMode } from "@/utils/gameEngine";
-import type { SpellDefinition } from "@/utils/spellRegistry";
+import type { SpellDefinition, SpellId } from "@/utils/spellRegistry";
 import { getAllSpells } from "@/utils/spellRegistry";
 import { useDuelWebRTC } from "@/hooks/useDuelWebRTC";
 import { getConnectionBanner } from "@/utils/connectionState";
+import type { SpellCastEvent } from "@/utils/networkManager";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -57,6 +59,7 @@ type HandTrackerProps = {
 type InputMode = "CV" | "MOUSE";
 
 type TrainingStatus = "ready" | "success" | "failure";
+type TrainingModeState = "LEARNING" | "FREE";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -150,8 +153,9 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
   const lastObservedTimeRef = useRef<number | null>(null);
   const dropoutStartRef = useRef<number | null>(null);
   const lastSegmentComputeAtRef = useRef<number>(0);
-  const sendCastRef = useRef<(spellId: string, confidence: number) => boolean>(() => false);
-  const sendStateSyncRef = useRef<(state: unknown) => boolean>(() => false);
+  const sendCastRef = useRef<(spellId: string, confidence: number, timestamp: number) => boolean>(() => false);
+  const sendStateUpdateRef = useRef<(gameState: GameState) => boolean>(() => false);
+  const processedHostEventsRef = useRef<Set<string>>(new Set());
   const frameRef = useRef<HTMLDivElement | null>(null);
   const localPreviewRef = useRef<HTMLVideoElement | null>(null);
   const startedDuelRef = useRef(false);
@@ -171,9 +175,10 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
   const [clockMs, setClockMs] = useState(() => Date.now());
   const [isMirrored, setIsMirrored] = useState(true);
   const [inputMode, setInputMode] = useState<InputMode>("CV");
-  const [selectedSpellId, setSelectedSpellId] = useState<string>("");
+  const [selectedSpellId, setSelectedSpellId] = useState<string>(() => getAllSpells()[0]?.id ?? "");
   const [isDrawing, setIsDrawing] = useState(false);
   const [trainingStatus, setTrainingStatus] = useState<TrainingStatus>("ready");
+  const [currentTrainingMode, setCurrentTrainingMode] = useState<TrainingModeState>("LEARNING");
   const [feedbackMessage, setFeedbackMessage] = useState("Draw the gesture to cast");
   const [attemptCount, setAttemptCount] = useState(0);
   const [successCount, setSuccessCount] = useState(0);
@@ -229,7 +234,11 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
       return null;
     }
 
-    const confidence = selectedSpell.detect(smoothed, frameLandmarks ?? []);
+    const normalized = normalizeGestureInput(smoothed, {
+      resamplePoints: 96,
+      targetSize: 220,
+    });
+    const confidence = selectedSpell.detect(normalized, frameLandmarks ?? []);
     if (confidence === null || confidence < TRAINING_SCORE_THRESHOLD) {
       return null;
     }
@@ -309,12 +318,18 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
     resetTrainingState(`Selected ${spell.displayName}. Draw the gesture to cast`);
   }, [clearTrainingResetTimer, resetTrainingState]);
 
-  useEffect(() => {
-    if (!isTrainingMode || selectedSpellId || allSpells.length === 0) {
-      return;
+  const toggleTrainingMode = useCallback(() => {
+    const nextMode: TrainingModeState = currentTrainingMode === "LEARNING" ? "FREE" : "LEARNING";
+    setCurrentTrainingMode(nextMode);
+    clearTrainingResetTimer();
+    setAttemptCount(0);
+    setSuccessCount(0);
+    if (nextMode === "FREE") {
+      resetTrainingState("Free Mode: Cast any spell");
+    } else {
+      resetTrainingState(selectedSpell ? `Selected ${selectedSpell.displayName}. Draw the gesture to cast` : "Draw the gesture to cast");
     }
-    setSelectedSpellId(allSpells[0].id);
-  }, [allSpells, isTrainingMode, selectedSpellId]);
+  }, [clearTrainingResetTimer, currentTrainingMode, resetTrainingState, selectedSpell]);
 
   useEffect(() => {
     return () => {
@@ -345,6 +360,55 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
     setFlashProgress(0);
   }, []);
 
+  const processHostCastEvent = useCallback((event: SpellCastEvent): boolean => {
+    if (!multiplayerEnabled || role !== "host") {
+      return false;
+    }
+
+    const eventId = `${event.playerId}-${event.timestamp}`;
+    if (processedHostEventsRef.current.has(eventId)) {
+      return false;
+    }
+    processedHostEventsRef.current.add(eventId);
+
+    const spellId = event.spellId as SpellId;
+    const spellDef = getAllSpells().find((spell) => spell.id === spellId);
+    if (!spellDef) {
+      return false;
+    }
+
+    const isHostAttacker = event.playerId === "host";
+    const applied = isHostAttacker
+      ? engineRef.current.castSpell(spellId, event.confidence, event.timestamp)
+      : engineRef.current.castOpponentSpell(spellId, event.timestamp);
+
+    if (!applied) {
+      return false;
+    }
+
+    const nextState = { ...engineRef.current.getState() };
+    setGameState(nextState);
+    void sendStateUpdateRef.current(nextState);
+    console.log("SYNC STATE:", nextState);
+
+    if (isHostAttacker) {
+      setFeedback({
+        spell: spellDef,
+        confidence: event.confidence,
+        at: Date.now(),
+        source: "player",
+      });
+      playSpellTone(spellDef.soundFrequencies, spellDef.soundWave);
+      addToast(`✨ ${spellDef.displayName}`, spellDef.color);
+    } else {
+      setOpponentCastFeedback(spellDef);
+      addToast(`⚔️ ${spellDef.displayName}!`, spellDef.color);
+      setTimeout(() => setOpponentCastFeedback(null), 2000);
+    }
+
+    return true;
+  }, [addToast, multiplayerEnabled, role]);
+
   const {
     status: peerStatus,
     error: peerError,
@@ -352,9 +416,8 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
     guestPresent,
     inviteUrl,
     sendCast,
+    sendStateUpdate,
     sendRestart,
-    sendStateSync,
-    sendMotionData,
     sendReady,
     startGame,
     localAlias,
@@ -371,42 +434,43 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
     enabled: multiplayerEnabled,
     role,
     roomId,
-    onPeerCast: (spellId) => {
-      const applied = engineRef.current.castOpponentSpell(spellId);
-      if (!applied) {
+    onPeerCast: (event) => {
+      if (role !== "host") {
         return;
       }
-      const spellDef = getAllSpells().find((s) => s.id === spellId);
-      if (spellDef) {
-        setOpponentCastFeedback(spellDef);
-        addToast(`⚔️ ${spellDef.displayName}!`, spellDef.color);
-        setTimeout(() => setOpponentCastFeedback(null), 2000);
+      processHostCastEvent({
+        ...event,
+        confidence: Math.max(0, Math.min(1, event.confidence)),
+      });
+    },
+    onPeerStateUpdate: (event) => {
+      const payload = event.gameState as GameState;
+      if (!payload || typeof payload !== "object" || !payload.player || !payload.opponent) {
+        return;
       }
+
+      const syncedState = role === "guest"
+        ? mapHostStateToGuestView(payload)
+        : payload;
+      setGameState({ ...syncedState });
     },
     onPeerRestart: () => {
       if (multiplayerEnabled) {
-        engineRef.current.startDuel("multiplayer", {
-          playerName: localAlias,
-          opponentName: remoteAlias,
-        });
+        if (role === "host") {
+          engineRef.current.startDuel("multiplayer", {
+            playerName: localAlias,
+            opponentName: remoteAlias,
+          });
+          const nextState = { ...engineRef.current.getState() };
+          setGameState(nextState);
+          void sendStateUpdate(nextState);
+        }
         startGame();
       } else {
         engineRef.current.startDuel(duelMode);
       }
       handleClear();
       addToast("Duel restarted by opponent.", "#9ad9ff");
-    },
-    onPeerStateSync: (statePayload) => {
-      if (role !== "guest") {
-        return;
-      }
-
-      const next = statePayload as GameState;
-      if (!next || typeof next !== "object" || !next.player || !next.opponent) {
-        return;
-      }
-
-      setGameState(mapHostStateToGuestView(next));
     },
   });
 
@@ -428,9 +492,16 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
 
     const unsub = engine.subscribe((event: EngineEvent) => {
       if (event.type === "state_change") {
-        setGameState({ ...event.state });
-        if (multiplayerEnabled && role === "host") {
-          sendStateSyncRef.current(event.state);
+        if (!multiplayerEnabled) {
+          setGameState({ ...event.state });
+          return;
+        }
+
+        if (role === "host") {
+          const nextState = { ...event.state };
+          setGameState(nextState);
+          void sendStateUpdateRef.current(nextState);
+          console.log("SYNC STATE:", nextState);
         }
       }
 
@@ -459,12 +530,16 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
   }, []);
 
   useEffect(() => {
-    sendCastRef.current = sendCast as (spellId: string, confidence: number) => boolean;
+    sendCastRef.current = sendCast as (spellId: string, confidence: number, timestamp: number) => boolean;
   }, [sendCast]);
 
   useEffect(() => {
-    sendStateSyncRef.current = sendStateSync as (state: unknown) => boolean;
-  }, [sendStateSync]);
+    sendStateUpdateRef.current = sendStateUpdate as (gameState: GameState) => boolean;
+  }, [sendStateUpdate]);
+
+  useEffect(() => {
+    processedHostEventsRef.current.clear();
+  }, [multiplayerEnabled, roomId]);
 
   // ── Flash animation ──────────────────────────────────────────────────────
   useEffect(() => {
@@ -497,12 +572,18 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
     }
 
     startedDuelRef.current = true;
-    addToast("Both players ready. Starting duel...", "#83ffc9");
     const timer = window.setTimeout(() => {
-      engineRef.current.startDuel("multiplayer", {
-        playerName: localAlias,
-        opponentName: remoteAlias,
-      });
+      addToast("Both players ready. Starting duel...", "#83ffc9");
+      if (role === "host") {
+        engineRef.current.startDuel("multiplayer", {
+          playerName: localAlias,
+          opponentName: remoteAlias,
+        });
+        const nextState = { ...engineRef.current.getState() };
+        setGameState(nextState);
+        void sendStateUpdateRef.current(nextState);
+        console.log("SYNC STATE:", nextState);
+      }
       handleClear();
       startGame();
     }, START_DELAY_MS);
@@ -510,7 +591,7 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
     return () => {
       window.clearTimeout(timer);
     };
-  }, [addToast, bothReady, handleClear, inGame, localAlias, multiplayerEnabled, remoteAlias, startGame]);
+  }, [addToast, bothReady, handleClear, inGame, localAlias, multiplayerEnabled, remoteAlias, role, startGame]);
 
   // ── Solo/training auto-start ─────────────────────────────────────────────
   useEffect(() => {
@@ -555,6 +636,54 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
     lastObservedTimeRef.current = pointTime;
 
     if (isTrainingMode) {
+      if (currentTrainingMode === "FREE") {
+        recognizer.feed(point);
+
+        setTrail((prev) => {
+          const last = prev[prev.length - 1];
+          if (!last || distance(last, point) >= 6) {
+            const next = [...prev, point].slice(-500);
+            trailRef.current = next;
+            return next;
+          }
+          return prev;
+        });
+
+        const match = recognizer.recognize(frameLandmarks ?? []);
+        if (match) {
+          setFeedback({
+            spell: match.spell,
+            confidence: match.confidence,
+            at: Date.now(),
+            source: "player",
+          });
+          setTrainingStatus("success");
+          setFeedbackMessage(`Detected: ${match.spell.displayName}`);
+          setTrail([]);
+          trailRef.current = [];
+          recognizer.clearTrail();
+          setSegments([]);
+          setIsDrawing(false);
+          playSpellTone(match.spell.soundFrequencies, match.spell.soundWave);
+        }
+
+        if (!showDebug || pointTime - lastSegmentComputeAtRef.current < SEGMENT_REFRESH_MS) {
+          return;
+        }
+
+        lastSegmentComputeAtRef.current = pointTime;
+        const currentTrail = recognizer.getTrail();
+        if (currentTrail.length > 6) {
+          const cleaned = filterByMinDistance(currentTrail, 5);
+          const smoothed = smoothPath(cleaned, 0.4);
+          const segs = segmentPath(smoothed).slice(-6);
+          setSegments(segs);
+        } else {
+          setSegments([]);
+        }
+        return;
+      }
+
       if (!selectedSpell) {
         return;
       }
@@ -612,22 +741,36 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
 
     if (match) {
       const spell = match.spell;
-      const cast = engine.castSpell(spell.id, match.confidence);
+      setTrail([]);
+      trailRef.current = [];
+      recognizer.clearTrail();
 
-      if (cast) {
-        setFeedback({
-          spell,
-          confidence: match.confidence,
-          at: Date.now(),
-          source: "player",
-        });
-        setTrail([]);
-        trailRef.current = [];
-        recognizer.clearTrail();
-        playSpellTone(spell.soundFrequencies, spell.soundWave);
-        addToast(`✨ ${spell.displayName}`, spell.color);
-        if (multiplayerEnabled) {
-          sendCastRef.current(spell.id, match.confidence);
+      if (multiplayerEnabled) {
+        const eventTimestamp = Date.now();
+        const normalizedConfidence = Math.max(0, Math.min(1, match.confidence));
+        if (role === "host") {
+          processHostCastEvent({
+            type: "CAST_SPELL",
+            spellId: spell.id,
+            timestamp: eventTimestamp,
+            confidence: normalizedConfidence,
+            playerId: "host",
+          });
+          sendCastRef.current(spell.id, normalizedConfidence, eventTimestamp);
+        } else {
+          sendCastRef.current(spell.id, normalizedConfidence, eventTimestamp);
+        }
+      } else {
+        const cast = engine.castSpell(spell.id, match.confidence);
+        if (cast) {
+          setFeedback({
+            spell,
+            confidence: match.confidence,
+            at: Date.now(),
+            source: "player",
+          });
+          playSpellTone(spell.soundFrequencies, spell.soundWave);
+          addToast(`✨ ${spell.displayName}`, spell.color);
         }
       }
     }
@@ -643,22 +786,20 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
       const smoothed = smoothPath(cleaned, 0.4);
       const segs = segmentPath(smoothed).slice(-6);
       setSegments(segs);
-      if (multiplayerEnabled) {
-        const speed = Math.hypot(velocityRef.current.x, velocityRef.current.y);
-        sendMotionData({ segments: segs, velocity: speed });
-      }
     } else {
       setSegments([]);
     }
   }, [
     addToast,
+    currentTrainingMode,
     detectSpecificSpell,
     detectionEnabled,
     isDrawing,
     isTrainingMode,
     multiplayerEnabled,
+    processHostCastEvent,
+    role,
     selectedSpell,
-    sendMotionData,
     showDebug,
     success,
   ]);
@@ -688,7 +829,13 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
 
       const tip = frameGesture.drawTip;
       if (!tip || !frameLandmarks) {
-        if (isTrainingMode && isDrawing && dropoutStartRef.current !== null && timestamp - dropoutStartRef.current > TRAINING_IDLE_END_MS) {
+        if (
+          isTrainingMode
+          && currentTrainingMode === "LEARNING"
+          && isDrawing
+          && dropoutStartRef.current !== null
+          && timestamp - dropoutStartRef.current > TRAINING_IDLE_END_MS
+        ) {
           handleGestureEnd(trailRef.current, latestLandmarksRef.current);
           return;
         }
@@ -728,11 +875,11 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
 
       processMotionPoint(point, frameLandmarks);
     },
-    [detectionEnabled, handleGestureEnd, inputMode, isDrawing, isTrainingMode, processMotionPoint],
+    [currentTrainingMode, detectionEnabled, handleGestureEnd, inputMode, isDrawing, isTrainingMode, processMotionPoint],
   );
 
   useEffect(() => {
-    if (!isTrainingMode || !isDrawing || !detectionEnabled) {
+    if (!isTrainingMode || currentTrainingMode !== "LEARNING" || !isDrawing || !detectionEnabled) {
       return;
     }
 
@@ -753,7 +900,7 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
     return () => {
       window.clearInterval(timer);
     };
-  }, [detectionEnabled, failure, handleGestureEnd, isDrawing, isTrainingMode]);
+  }, [currentTrainingMode, detectionEnabled, failure, handleGestureEnd, isDrawing, isTrainingMode]);
 
   // ── Tracking hook ────────────────────────────────────────────────────────
   const { videoRef, landmarks, cameraStream, gesture, fps, isReady, error, videoSize } =
@@ -816,11 +963,11 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
   }, [detectionEnabled, inputMode, isMirrored, processMotionPoint, videoSize.height, videoSize.width]);
 
   const handleMouseLeave = useCallback(() => {
-    if (!isTrainingMode || inputMode !== "MOUSE" || !isDrawing) {
+    if (!isTrainingMode || currentTrainingMode !== "LEARNING" || inputMode !== "MOUSE" || !isDrawing) {
       return;
     }
     handleGestureEnd(trailRef.current, null);
-  }, [handleGestureEnd, inputMode, isDrawing, isTrainingMode]);
+  }, [currentTrainingMode, handleGestureEnd, inputMode, isDrawing, isTrainingMode]);
 
   // ── Keep preview synced for local camera-only monitor ───────────────────
   useEffect(() => {
@@ -836,7 +983,12 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
   // ── Reset trails while waiting for IN_GAME ───────────────────────────────
   useEffect(() => {
     if (!detectionEnabled) {
-      handleClear();
+      const timeoutId = window.setTimeout(() => {
+        handleClear();
+      }, 0);
+      return () => {
+        window.clearTimeout(timeoutId);
+      };
     }
   }, [detectionEnabled, handleClear]);
 
@@ -919,9 +1071,13 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
             {isTrainingMode && (
               <div className={`training-feedback ${trainingStatus}`}>
                 <p className="training-feedback-text">{feedbackMessage}</p>
-                <p className="training-feedback-sub">
-                  Attempts {attemptCount} · Success {successCount} · Accuracy {trainingAccuracy}%
-                </p>
+                {currentTrainingMode === "LEARNING" ? (
+                  <p className="training-feedback-sub">
+                    Attempts {attemptCount} · Success {successCount} · Accuracy {trainingAccuracy}%
+                  </p>
+                ) : (
+                  <p className="training-feedback-sub">Cast any gesture to see detected spell</p>
+                )}
               </div>
             )}
 
@@ -988,12 +1144,18 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
                       addToast("Both players must be ready to restart.", "#ffb670");
                       return;
                     }
-                    engineRef.current.startDuel("multiplayer", {
-                      playerName: localAlias,
-                      opponentName: remoteAlias,
-                    });
-                    startGame();
+                    if (role === "host") {
+                      engineRef.current.startDuel("multiplayer", {
+                        playerName: localAlias,
+                        opponentName: remoteAlias,
+                      });
+                      const nextState = { ...engineRef.current.getState() };
+                      setGameState(nextState);
+                      void sendStateUpdateRef.current(nextState);
+                      console.log("SYNC STATE:", nextState);
+                    }
                     void sendRestart();
+                    startGame();
                   } else {
                     engineRef.current.startDuel(duelMode);
                   }
@@ -1003,6 +1165,15 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
               >
                 {isTrainingMode ? "Reset Training" : "Restart Duel"}
               </button>
+              {isTrainingMode && (
+                <button
+                  type="button"
+                  onClick={toggleTrainingMode}
+                  className="btn-debug"
+                >
+                  {currentTrainingMode === "LEARNING" ? "Switch to Free Mode" : "Switch to Learning Mode"}
+                </button>
+              )}
             </div>
           </div>
         </div>
@@ -1016,14 +1187,24 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
 
           {isTrainingMode && selectedSpell && (
             <div className="training-panel">
-              <p className="duel-subtitle">Selected Spell: {selectedSpell.displayName}</p>
-              <p className="duel-subtitle">Type: {selectedSpell.category.toUpperCase()}</p>
-              <p className="duel-subtitle">
-                {selectedSpell.category === "defense"
-                  ? `Shield: ${selectedSpell.effect.shieldStrength}`
-                  : `Damage: ${selectedSpell.effect.damage}`}
-              </p>
-              <p className="duel-subtitle">Draw the gesture to cast</p>
+              <p className="duel-subtitle">Mode: {currentTrainingMode}</p>
+              {currentTrainingMode === "LEARNING" ? (
+                <>
+                  <p className="duel-subtitle">Selected Spell: {selectedSpell.displayName}</p>
+                  <p className="duel-subtitle">Type: {selectedSpell.category.toUpperCase()}</p>
+                  <p className="duel-subtitle">
+                    {selectedSpell.category === "defense"
+                      ? `Shield: ${selectedSpell.effect.shieldStrength}`
+                      : `Damage: ${selectedSpell.effect.damage}`}
+                  </p>
+                  <p className="duel-subtitle">Draw the gesture to cast</p>
+                </>
+              ) : (
+                <>
+                  <p className="duel-subtitle">Cast any gesture freely</p>
+                  <p className="duel-subtitle">Detected spell appears on overlay</p>
+                </>
+              )}
             </div>
           )}
 
@@ -1090,6 +1271,7 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
             spells={allSpells}
             selectedSpellId={selectedSpell?.id ?? null}
             onSelect={handleSpellSelect}
+            disabled={currentTrainingMode === "FREE"}
           />
         ) : (
           <>
@@ -1243,10 +1425,12 @@ function TrainingSpellGrid({
   spells,
   selectedSpellId,
   onSelect,
+  disabled,
 }: {
   spells: SpellDefinition[];
   selectedSpellId: string | null;
   onSelect: (spell: SpellDefinition) => void;
+  disabled: boolean;
 }) {
   return (
     <div className="spell-grid-wrap">
@@ -1277,9 +1461,10 @@ function TrainingSpellGrid({
               <button
                 type="button"
                 className="btn-debug"
+                disabled={disabled}
                 onClick={() => onSelect(spell)}
               >
-                {isSelected ? "Selected" : "Select"}
+                {disabled ? "Free Mode" : isSelected ? "Selected" : "Select"}
               </button>
             </div>
           );

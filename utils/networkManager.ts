@@ -4,9 +4,16 @@ import type { MotionSegment } from "@/utils/motionGesture";
 export type Role = "host" | "guest";
 
 export type SpellCastEvent = {
-  type: "SPELL_CAST";
+  type: "CAST_SPELL";
   spellId: SpellId;
   confidence: number;
+  timestamp: number;
+  playerId: string;
+};
+
+export type StateUpdateEvent = {
+  type: "STATE_UPDATE";
+  gameState: unknown;
   timestamp: number;
 };
 
@@ -27,12 +34,6 @@ export type RestartEvent = {
   type: "RESTART";
 };
 
-export type StateSyncEvent = {
-  type: "STATE_SYNC";
-  state: unknown;
-  timestamp: number;
-};
-
 export type PingEvent = {
   type: "PING";
   timestamp: number;
@@ -45,10 +46,10 @@ export type PongEvent = {
 
 export type PeerEvent =
   | SpellCastEvent
+  | StateUpdateEvent
   | MotionDataEvent
   | ReadyEvent
   | RestartEvent
-  | StateSyncEvent
   | PingEvent
   | PongEvent;
 
@@ -83,13 +84,29 @@ export const decodePeerMessage = (raw: string): PeerMessage | null => {
       return null;
     }
 
-    if (hasType(payload, "SPELL_CAST") && typeof payload.spellId === "string") {
+    const isCastPayload =
+      (hasType(payload, "CAST_SPELL") || hasType(payload, "SPELL_CAST" as PeerEvent["type"]))
+      && typeof payload.spellId === "string";
+
+    if (isCastPayload) {
       return {
         from,
         payload: {
-          type: "SPELL_CAST",
+          type: "CAST_SPELL",
           spellId: payload.spellId as SpellId,
-          confidence: Number(payload.confidence ?? 1),
+          confidence: Math.max(0, Math.min(1, Number(payload.confidence ?? 1))),
+          timestamp: Number(payload.timestamp ?? Date.now()),
+          playerId: typeof payload.playerId === "string" ? payload.playerId : from,
+        },
+      };
+    }
+
+    if (hasType(payload, "STATE_UPDATE")) {
+      return {
+        from,
+        payload: {
+          type: "STATE_UPDATE",
+          gameState: payload.gameState,
           timestamp: Number(payload.timestamp ?? Date.now()),
         },
       };
@@ -104,17 +121,6 @@ export const decodePeerMessage = (raw: string): PeerMessage | null => {
           velocity: Number(payload.velocity ?? 0),
           timestamp: Number(payload.timestamp ?? Date.now()),
           spellId: typeof payload.spellId === "string" ? payload.spellId : undefined,
-        },
-      };
-    }
-
-    if (hasType(payload, "STATE_SYNC")) {
-      return {
-        from,
-        payload: {
-          type: "STATE_SYNC",
-          state: payload.state,
-          timestamp: Number(payload.timestamp ?? Date.now()),
         },
       };
     }

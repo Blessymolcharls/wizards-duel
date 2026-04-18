@@ -7,6 +7,8 @@ import {
   decodePeerMessage,
   encodePeerMessage,
   type MotionDataEvent,
+  type SpellCastEvent,
+  type StateUpdateEvent,
   type PeerEvent,
   type Role,
 } from "@/utils/networkManager";
@@ -38,9 +40,9 @@ type UseDuelWebRTCOptions = {
   role: Role;
   enabled: boolean;
   localStream?: MediaStream | null;
-  onPeerCast: (spellId: SpellId, confidence?: number) => void;
+  onPeerCast: (event: SpellCastEvent) => void;
+  onPeerStateUpdate?: (event: StateUpdateEvent) => void;
   onPeerRestart?: () => void;
-  onPeerStateSync?: (state: unknown) => void;
   onPeerMotion?: (motion: MotionDataEvent) => void;
 };
 
@@ -98,15 +100,14 @@ const RTC_CONFIG: RTCConfiguration = {
 const SIGNAL_POLL_MS = 350;
 const PING_INTERVAL_MS = 2500;
 const MOTION_SEND_INTERVAL_MS = 66; // ~15 updates/s
-const STATE_SYNC_INTERVAL_MS = 75;
 
 export const useDuelWebRTC = ({
   roomId,
   role,
   enabled,
   onPeerCast,
+  onPeerStateUpdate,
   onPeerRestart,
-  onPeerStateSync,
   onPeerMotion,
 }: UseDuelWebRTCOptions) => {
   const [status, setStatus] = useState<PeerStatus>(enabled ? "waiting" : "idle");
@@ -133,8 +134,8 @@ export const useDuelWebRTC = ({
   const roomUnavailableRef = useRef(false);
   const statusRef = useRef<PeerStatus>(enabled ? "waiting" : "idle");
   const onPeerCastRef = useRef(onPeerCast);
+  const onPeerStateUpdateRef = useRef(onPeerStateUpdate);
   const onPeerRestartRef = useRef(onPeerRestart);
-  const onPeerStateSyncRef = useRef(onPeerStateSync);
   const onPeerMotionRef = useRef(onPeerMotion);
   const pendingIceCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const hasPeerTransportRef = useRef(false);
@@ -143,7 +144,6 @@ export const useDuelWebRTC = ({
   const inGameRef = useRef(false);
   const latencyTrackerRef = useRef(new LatencyTracker());
   const throttleMotionRef = useRef(createThrottle(MOTION_SEND_INTERVAL_MS));
-  const throttleStateSyncRef = useRef(createThrottle(STATE_SYNC_INTERVAL_MS));
 
   const { localAlias, remoteAlias } = useMemo(
     () => getDuelAliases(roomId, role),
@@ -179,12 +179,12 @@ export const useDuelWebRTC = ({
   }, [onPeerCast]);
 
   useEffect(() => {
-    onPeerRestartRef.current = onPeerRestart;
-  }, [onPeerRestart]);
+    onPeerStateUpdateRef.current = onPeerStateUpdate;
+  }, [onPeerStateUpdate]);
 
   useEffect(() => {
-    onPeerStateSyncRef.current = onPeerStateSync;
-  }, [onPeerStateSync]);
+    onPeerRestartRef.current = onPeerRestart;
+  }, [onPeerRestart]);
 
   useEffect(() => {
     onPeerMotionRef.current = onPeerMotion;
@@ -274,8 +274,13 @@ export const useDuelWebRTC = ({
 
     const { payload } = parsed;
 
-    if (payload.type === "SPELL_CAST") {
-      onPeerCastRef.current(payload.spellId, payload.confidence);
+    if (payload.type === "CAST_SPELL") {
+      onPeerCastRef.current(payload);
+      return;
+    }
+
+    if (payload.type === "STATE_UPDATE") {
+      onPeerStateUpdateRef.current?.(payload);
       return;
     }
 
@@ -284,11 +289,6 @@ export const useDuelWebRTC = ({
       setInGame(false);
       onPeerRestartRef.current?.();
       updateConnectionState();
-      return;
-    }
-
-    if (payload.type === "STATE_SYNC") {
-      onPeerStateSyncRef.current?.(payload.state);
       return;
     }
 
@@ -623,10 +623,20 @@ export const useDuelWebRTC = ({
   }, [enabled, handleAnswer, handleIceCandidate, handleOffer, role, roomId, sendOffer]);
 
   const sendCast = useCallback(
-    (spellId: SpellId, confidence = 1): boolean => sendPeerEvent({
-      type: "SPELL_CAST",
+    (spellId: SpellId, confidence = 1, timestamp = Date.now()): boolean => sendPeerEvent({
+      type: "CAST_SPELL",
       spellId,
-      confidence,
+      confidence: Math.max(0, Math.min(1, confidence)),
+      timestamp,
+      playerId: role,
+    }),
+    [role, sendPeerEvent],
+  );
+
+  const sendStateUpdate = useCallback(
+    (gameState: unknown): boolean => sendPeerEvent({
+      type: "STATE_UPDATE",
+      gameState,
       timestamp: Date.now(),
     }),
     [sendPeerEvent],
@@ -638,18 +648,6 @@ export const useDuelWebRTC = ({
     updateConnectionState();
     return sendPeerEvent({ type: "RESTART" });
   }, [sendPeerEvent, updateConnectionState]);
-
-  const sendStateSync = useCallback(
-    (state: unknown): boolean =>
-      throttleStateSyncRef.current((payload) => {
-        void sendPeerEvent({
-          type: "STATE_SYNC",
-          state: payload,
-          timestamp: Date.now(),
-        });
-      }, state),
-    [sendPeerEvent],
-  );
 
   const sendMotionData = useCallback(
     (event: Omit<MotionDataEvent, "type" | "timestamp">): boolean =>
@@ -768,8 +766,8 @@ export const useDuelWebRTC = ({
     guestPresent,
     inviteUrl,
     sendCast,
+    sendStateUpdate,
     sendRestart,
-    sendStateSync,
     sendMotionData,
     sendReady,
     startGame,

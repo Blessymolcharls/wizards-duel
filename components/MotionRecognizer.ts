@@ -23,6 +23,7 @@ import {
 import type { Point } from "@/utils/gestureUtils";
 import {
   filterByMinDistance,
+  normalizeGestureInput,
   smoothPath,
   pathLength,
 } from "@/utils/gestureUtils";
@@ -128,6 +129,10 @@ export class MotionRecognizer {
     const cleaned = filterByMinDistance(this.trail, s.minMovement * 0.5);
     if (cleaned.length < 5) return null;
     const smoothed = smoothPath(cleaned, s.smoothingFactor);
+    const normalized = normalizeGestureInput(smoothed, {
+      resamplePoints: 96,
+      targetSize: 220,
+    });
 
     // Try spells in priority order (skip Protego Maxima — handled above)
     for (const spellId of SPELL_PRIORITY) {
@@ -138,7 +143,7 @@ export class MotionRecognizer {
       if (now - lastCast < s.castDebounceMs) continue;
 
       const spell = SPELL_REGISTRY[spellId];
-      const confidence = spell.detect(smoothed, landmarks);
+      const confidence = spell.detect(normalized, landmarks);
 
       if (confidence !== null && confidence > 0) {
         this.lastCastAt[spellId] = now;
@@ -172,7 +177,11 @@ export class MotionRecognizer {
     const lastCast = this.lastCastAt["protego_maxima"] ?? 0;
     if (now - lastCast < s.castDebounceMs * 3) return null;
 
-    const confidence = spell.detect(points, []);
+    const normalized = normalizeGestureInput(points, {
+      resamplePoints: 96,
+      targetSize: 220,
+    });
+    const confidence = spell.detect(normalized, []);
     if (confidence === null || confidence <= 0) {
       return null;
     }

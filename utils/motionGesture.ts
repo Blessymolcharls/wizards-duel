@@ -81,11 +81,6 @@ function signedAngleBetween(
   return Math.atan2(ax * by - ay * bx, ax * bx + ay * by);
 }
 
-/** Bearing angle of a direction vector, 0 = right, CW positive */
-function bearing(dx: number, dy: number): number {
-  return Math.atan2(dy, dx);
-}
-
 // ─── Direction classification ─────────────────────────────────────────────────
 
 /** Map a (dx, dy) vector to one of the 8 discrete compass directions */

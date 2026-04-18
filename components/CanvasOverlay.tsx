@@ -31,6 +31,8 @@ type CanvasOverlayProps = {
   showDebug: boolean;
   active: boolean;
   trailColor: string;
+  trailThickness?: number;
+  trailFadeDurationMs?: number;
   spellColor: string | null;
   spellFlashProgress: number;
   segments: MotionSegment[];
@@ -45,6 +47,8 @@ function drawTrail(
   trailColor: string,
   sx: number,
   sy: number,
+  trailThickness: number,
+  trailFadeDurationMs: number,
 ): void {
   if (path.length < 2) return;
 
@@ -55,8 +59,9 @@ function drawTrail(
   // Draw trail with gradient opacity (older = more transparent)
   for (let i = 1; i < path.length; i++) {
     const progress = i / path.length;
-    const alpha = active ? 0.3 + progress * 0.7 : 0.15 + progress * 0.5;
-    const width = active ? 3 + progress * 5 : 2 + progress * 3;
+    const fadeScale = Math.max(0.25, Math.min(2, trailFadeDurationMs / 700));
+    const alpha = (active ? 0.3 + progress * 0.7 : 0.15 + progress * 0.5) * fadeScale;
+    const width = (active ? 3 + progress * 5 : 2 + progress * 3) * Math.max(0.5, trailThickness / 4);
 
     ctx.beginPath();
     ctx.moveTo(path[i - 1].x * sx, path[i - 1].y * sy);
@@ -144,7 +149,6 @@ function drawDebugOverlay(
   ctx.save();
 
   // Draw segment direction vectors at segment midpoints
-  let pointIdx = 0;
   for (const seg of segments) {
     const pts = seg.points;
     if (pts.length < 2) continue;
@@ -180,8 +184,6 @@ function drawDebugOverlay(
     ctx.fillStyle = "rgba(255,255,255,0.75)";
     ctx.shadowBlur = 0;
     ctx.fillText(velText, mid.x * sx - 15, mid.y * sy + 16);
-
-    pointIdx += seg.points.length;
   }
 
   ctx.restore();
@@ -232,6 +234,8 @@ export function CanvasOverlay({
   showDebug,
   active,
   trailColor,
+  trailThickness = 4,
+  trailFadeDurationMs = 700,
   spellColor,
   spellFlashProgress,
   segments,
@@ -262,7 +266,7 @@ export function CanvasOverlay({
     const sy = h / Math.max(1, sourceHeight);
 
     if (showTrail) {
-      drawTrail(ctx, path, active, trailColor, sx, sy);
+      drawTrail(ctx, path, active, trailColor, sx, sy, trailThickness, trailFadeDurationMs);
     }
 
     if (showSkeleton && landmarks) {
@@ -281,6 +285,7 @@ export function CanvasOverlay({
     showDebug, showSkeleton, showTrail,
     sourceHeight, sourceWidth,
     spellColor, spellFlashProgress, trailColor,
+    trailFadeDurationMs, trailThickness,
   ]);
 
   return (
