@@ -46,6 +46,14 @@ export type MotionRecognizerSettings = {
   palmHoldMs: number;
   /** Landmark velocity (normalized units/s) below which the hand is "still" */
   palmStillThreshold: number;
+  /** Minimum confidence required before returning a match */
+  confidenceThreshold: number;
+  /** Gesture timeout window; stale trail points are trimmed */
+  gestureTimeoutMs: number;
+  /** Minimum gesture length (alias for external settings) */
+  minGestureLength: number;
+  /** Minimum interval between recognition passes */
+  recognitionIntervalMs: number;
 };
 
 export const DEFAULT_RECOGNIZER_SETTINGS: MotionRecognizerSettings = {
@@ -56,6 +64,10 @@ export const DEFAULT_RECOGNIZER_SETTINGS: MotionRecognizerSettings = {
   minMovement: 6,
   palmHoldMs: 1000,
   palmStillThreshold: 0.08,
+  confidenceThreshold: 0.45,
+  gestureTimeoutMs: 320,
+  minGestureLength: 60,
+  recognitionIntervalMs: 42,
 };
 
 // ─── Per-spell debounce map ───────────────────────────────────────────────────
@@ -71,6 +83,7 @@ export class MotionRecognizer {
   private prevLandmarks: LandmarkLike[] | null = null;
   private prevLandmarkTime: number | null = null;
   private palmHoldStart: number | null = null;
+  private lastRecognizeAt = 0;
 
   constructor(settings: Partial<MotionRecognizerSettings> = {}) {
     this.settings = { ...DEFAULT_RECOGNIZER_SETTINGS, ...settings };
@@ -91,6 +104,15 @@ export class MotionRecognizer {
     }
 
     this.trail.push(point);
+
+    // Keep recent points only so stale gestures do not stay in memory.
+    const now = point.t ?? Date.now();
+    while (
+      this.trail.length > 5
+      && now - (this.trail[0].t ?? now) > s.gestureTimeoutMs
+    ) {
+      this.trail.shift();
+    }
 
     // Trim trail by path length to prevent unbounded growth
     while (this.trail.length > 5 && pathLength(this.trail) > s.maxTrailLengthPx) {
@@ -118,12 +140,18 @@ export class MotionRecognizer {
     const s = this.settings;
     const now = Date.now();
 
+    if (now - this.lastRecognizeAt < s.recognitionIntervalMs) {
+      return null;
+    }
+    this.lastRecognizeAt = now;
+
     // ── Protego Maxima (circle-trace gesture) ──────────────────────────────
     const protegoMaximaResult = this.tryProtegoMaxima(this.trail, now);
     if (protegoMaximaResult) return protegoMaximaResult;
 
     // ── Trail-based detectors ──────────────────────────────────────────────
-    if (pathLength(this.trail) < s.minTrailLength) return null;
+    const minLength = Math.max(s.minTrailLength, s.minGestureLength);
+    if (pathLength(this.trail) < minLength) return null;
 
     // Pre-process trail
     const cleaned = filterByMinDistance(this.trail, s.minMovement * 0.5);
@@ -145,7 +173,7 @@ export class MotionRecognizer {
       const spell = SPELL_REGISTRY[spellId];
       const confidence = spell.detect(normalized, landmarks);
 
-      if (confidence !== null && confidence > 0) {
+      if (confidence !== null && confidence >= s.confidenceThreshold) {
         this.lastCastAt[spellId] = now;
         this.trail = []; // consume trail after successful detection
         return {

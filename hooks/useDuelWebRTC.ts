@@ -100,6 +100,7 @@ const RTC_CONFIG: RTCConfiguration = {
 const SIGNAL_POLL_MS = 350;
 const PING_INTERVAL_MS = 2500;
 const MOTION_SEND_INTERVAL_MS = 66; // ~15 updates/s
+const STATE_SEND_INTERVAL_MS = 90;
 
 export const useDuelWebRTC = ({
   roomId,
@@ -144,6 +145,7 @@ export const useDuelWebRTC = ({
   const inGameRef = useRef(false);
   const latencyTrackerRef = useRef(new LatencyTracker());
   const throttleMotionRef = useRef(createThrottle(MOTION_SEND_INTERVAL_MS));
+  const throttleStateRef = useRef(createThrottle(STATE_SEND_INTERVAL_MS));
 
   const { localAlias, remoteAlias } = useMemo(
     () => getDuelAliases(roomId, role),
@@ -634,11 +636,14 @@ export const useDuelWebRTC = ({
   );
 
   const sendStateUpdate = useCallback(
-    (gameState: unknown): boolean => sendPeerEvent({
-      type: "STATE_UPDATE",
-      gameState,
-      timestamp: Date.now(),
-    }),
+    (gameState: unknown): boolean =>
+      throttleStateRef.current((payload) => {
+        void sendPeerEvent({
+          type: "STATE_UPDATE",
+          gameState: payload,
+          timestamp: Date.now(),
+        });
+      }, gameState),
     [sendPeerEvent],
   );
 

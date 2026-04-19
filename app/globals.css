@@ -260,6 +260,64 @@ body {
   pointer-events: none;
 }
 
+.probability-badge {
+  position: absolute;
+  top: 16px;
+  right: 64px;
+  font-size: 11px;
+  letter-spacing: 0.09em;
+  color: #9de9ff;
+  background: rgba(2, 10, 18, 0.78);
+  border: 1px solid rgba(76, 242, 255, 0.24);
+  border-radius: 999px;
+  padding: 4px 10px;
+  backdrop-filter: blur(6px);
+  z-index: 9;
+  pointer-events: none;
+}
+
+.settings-fab {
+  position: absolute;
+  top: 12px;
+  right: 14px;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border: 1px solid rgba(76, 242, 255, 0.28);
+  background: rgba(3, 10, 20, 0.8);
+  color: #b8f5ff;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  transition: transform 0.16s ease, border-color 0.16s ease, background 0.16s ease;
+  z-index: 11;
+}
+
+.settings-fab:hover {
+  transform: rotate(18deg);
+  border-color: rgba(76, 242, 255, 0.5);
+  background: rgba(7, 16, 30, 0.92);
+}
+
+.settings-popover {
+  position: absolute;
+  top: 56px;
+  right: 14px;
+  z-index: 12;
+  animation: settingsIn 0.18s ease;
+}
+
+@keyframes settingsIn {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 /* ─── Controls bar ─────────────────────────────────────────────────────────── */
 .controls-bar {
   position: absolute;

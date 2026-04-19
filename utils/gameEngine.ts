@@ -111,6 +111,7 @@ export class GameEngine {
   private listeners: Set<EventListener> = new Set();
   private dotIntervalId: ReturnType<typeof setInterval> | null = null;
   private aiTimeoutId: ReturnType<typeof setTimeout> | null = null;
+  private confidenceFloor = 0;
 
   constructor() {
     this.state = this.buildInitialState();
@@ -141,12 +142,17 @@ export class GameEngine {
     this.emit({ type: "state_change", state: this.state });
   }
 
+  setConfidenceFloor(value: number): void {
+    this.confidenceFloor = Math.max(0, Math.min(0.99, value));
+  }
+
   /**
    * Main entry point — called by the MotionRecognizer when a spell is detected.
    * Returns false if the spell is on cooldown or blocked by a status effect.
    */
   castSpell(spellId: SpellId, confidence: number, castedAt = Date.now()): boolean {
     if (this.state.phase !== "dueling") return false;
+    if (confidence < this.confidenceFloor) return false;
 
     // Check cooldown
     const readyAt = this.state.cooldowns[spellId] ?? 0;

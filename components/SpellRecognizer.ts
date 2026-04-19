@@ -27,6 +27,11 @@ export type SpellMatch = {
   score: number;
 };
 
+export type SpellCandidate = {
+  spell: SpellName;
+  score: number;
+};
+
 type Template = {
   name: string;
   spell: SpellName;
@@ -102,5 +107,29 @@ export class SpellRecognizer {
       spell: best.spell,
       score,
     };
+  }
+
+  evaluateCandidates(
+    rawPath: Point[],
+    settings: RecognitionSettings,
+    limit = 3,
+  ): SpellCandidate[] {
+    if (pathLength(rawPath) < settings.minStrokeLength) {
+      return [];
+    }
+
+    this.ensureResolution(settings.resamplingResolution);
+    const normalized = normalizePath(rawPath, settings.resamplingResolution);
+
+    return this.templates
+      .map((template) => {
+        const scoreDistance = pathDistance(normalized, template.points);
+        return {
+          spell: template.spell,
+          score: normalizedScore(scoreDistance),
+        };
+      })
+      .sort((a, b) => b.score - a.score)
+      .slice(0, Math.max(1, limit));
   }
 }

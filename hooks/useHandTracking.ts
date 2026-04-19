@@ -8,6 +8,7 @@ export type TrackingSettings = {
   trackingConfidence: number;
   maxHands: number;
   modelComplexity: 0 | 1;
+  fpsCap?: number;
 };
 
 export type GestureState = {
@@ -138,6 +139,7 @@ export const useHandTracking = (
   const rafRef = useRef<number | null>(null);
   const runningRef = useRef(false);
   const sendingRef = useRef(false);
+  const lastSentAtRef = useRef(0);
   const lastFrameTimeRef = useRef(0);
   const lastUiEmitTimeRef = useRef(0);
   const lastFpsUiTimeRef = useRef(0);
@@ -297,13 +299,19 @@ export const useHandTracking = (
         const player = videoRef.current;
         const tracker = handsRef.current;
 
+        const now = performance.now();
+        const fpsCap = Math.max(8, settings.fpsCap ?? CAPTURE_FPS);
+        const minIntervalMs = 1000 / fpsCap;
+
         if (
           player &&
           tracker &&
           player.readyState >= 2 &&
-          !sendingRef.current
+          !sendingRef.current &&
+          now - lastSentAtRef.current >= minIntervalMs
         ) {
           sendingRef.current = true;
+          lastSentAtRef.current = now;
           void tracker.send({ image: player }).finally(() => {
             sendingRef.current = false;
           });

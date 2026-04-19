@@ -11,9 +11,9 @@ import {
 } from "react";
 import { CanvasOverlay } from "@/components/CanvasOverlay";
 import { MotionRecognizer } from "@/components/MotionRecognizer";
+import { SettingsPanel } from "@/components/SettingsPanel";
 import {
   type TrackingFrame,
-  type TrackingSettings,
   useHandTracking,
 } from "@/hooks/useHandTracking";
 import {
@@ -30,6 +30,15 @@ import { getAllSpells } from "@/utils/spellRegistry";
 import { useDuelWebRTC } from "@/hooks/useDuelWebRTC";
 import { getConnectionBanner } from "@/utils/connectionState";
 import type { SpellCastEvent } from "@/utils/networkManager";
+import { evaluateSpellProbabilities } from "@/utils/probabilityEvaluator";
+import {
+  deriveRecognizerSettings,
+  deriveTrackingSettings,
+  loadDuelSettings,
+  saveDuelSettings,
+  sanitizeDuelSettings,
+  type DuelSettings,
+} from "@/utils/settingsManager";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -56,19 +65,10 @@ type HandTrackerProps = {
   };
 };
 
-type InputMode = "CV" | "MOUSE";
-
 type TrainingStatus = "ready" | "success" | "failure";
 type TrainingModeState = "LEARNING" | "FREE";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
-
-const DEFAULT_TRACKING: TrackingSettings = {
-  detectionConfidence: 0.4,
-  trackingConfidence: 0.35,
-  maxHands: 1,
-  modelComplexity: 0,
-};
 
 const SPELL_TOAST_TTL = 2800;
 const FEEDBACK_TTL = 2600;
@@ -76,9 +76,8 @@ const FLASH_DECAY_MS = 800;
 const SEGMENT_REFRESH_MS = 120;
 const START_DELAY_MS = 650;
 const TRAINING_MIN_POINTS = 10;
-const TRAINING_SCORE_THRESHOLD = 0.45;
 const TRAINING_MAX_ATTEMPT_MS = 2300;
-const TRAINING_IDLE_END_MS = 340;
+const DEFAULT_PROBABILITY_REFRESH_MS = 80;
 
 const mapHostStateToGuestView = (hostState: GameState): GameState => ({
   ...hostState,
@@ -162,6 +161,8 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
   const trainingAttemptStartRef = useRef<number | null>(null);
   const trainingResetTimerRef = useRef<number | null>(null);
   const latestLandmarksRef = useRef<TrackingFrame["landmarks"]>(null);
+  const lastProbabilityAtRef = useRef(0);
+  const lastMousePointRef = useRef<Point | null>(null);
 
   // ── State ───────────────────────────────────────────────────────────────────
   const [trail, setTrail] = useState<Point[]>([]);
@@ -173,8 +174,8 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
   const [showDebug, setShowDebug] = useState(false);
   const [opponentCastFeedback, setOpponentCastFeedback] = useState<SpellDefinition | null>(null);
   const [clockMs, setClockMs] = useState(() => Date.now());
-  const [isMirrored, setIsMirrored] = useState(true);
-  const [inputMode, setInputMode] = useState<InputMode>("CV");
+  const [showSettingsPanel, setShowSettingsPanel] = useState(false);
+  const [settings, setSettings] = useState<DuelSettings>(() => loadDuelSettings());
   const [selectedSpellId, setSelectedSpellId] = useState<string>(() => getAllSpells()[0]?.id ?? "");
   const [isDrawing, setIsDrawing] = useState(false);
   const [trainingStatus, setTrainingStatus] = useState<TrainingStatus>("ready");
@@ -182,6 +183,7 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
   const [feedbackMessage, setFeedbackMessage] = useState("Draw the gesture to cast");
   const [attemptCount, setAttemptCount] = useState(0);
   const [successCount, setSuccessCount] = useState(0);
+  const [topProbability, setTopProbability] = useState<{ spell: SpellDefinition; confidence: number } | null>(null);
 
   const multiplayerEnabled = Boolean(multiplayer?.enabled);
   const duelMode: GameMode = multiplayerEnabled ? "multiplayer" : mode;
@@ -194,6 +196,24 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
     () => allSpells.find((spell) => spell.id === selectedSpellId) ?? allSpells[0] ?? null,
     [allSpells, selectedSpellId],
   );
+
+  const inputMode = settings.input.mode;
+  const isMirrored = settings.input.camera.mirror;
+
+  const trackingSettings = useMemo(() => deriveTrackingSettings(settings), [settings]);
+  const recognizerSettings = useMemo(() => deriveRecognizerSettings(settings), [settings]);
+
+  useEffect(() => {
+    saveDuelSettings(settings);
+  }, [settings]);
+
+  useEffect(() => {
+    recognizerRef.current.updateSettings(recognizerSettings);
+  }, [recognizerSettings]);
+
+  useEffect(() => {
+    engineRef.current.setConfidenceFloor(settings.detection.confidenceThreshold);
+  }, [settings.detection.confidenceThreshold]);
 
   const clearTrainingResetTimer = useCallback(() => {
     if (trainingResetTimerRef.current !== null) {
@@ -229,7 +249,7 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
       return null;
     }
 
-    const smoothed = smoothPath(cleaned, 0.4);
+    const smoothed = smoothPath(cleaned, settings.detection.smoothingFactor);
     if (smoothed.length < TRAINING_MIN_POINTS) {
       return null;
     }
@@ -239,12 +259,12 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
       targetSize: 220,
     });
     const confidence = selectedSpell.detect(normalized, frameLandmarks ?? []);
-    if (confidence === null || confidence < TRAINING_SCORE_THRESHOLD) {
+    if (confidence === null || confidence < settings.detection.confidenceThreshold) {
       return null;
     }
 
     return Math.min(1, confidence);
-  }, [selectedSpell]);
+  }, [selectedSpell, settings.detection.confidenceThreshold, settings.detection.smoothingFactor]);
 
   const success = useCallback((spell: SpellDefinition, confidence: number) => {
     clearTrainingResetTimer();
@@ -260,6 +280,7 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
       at: Date.now(),
       source: "player",
     });
+    setTopProbability(null);
     setTrail([]);
     trailRef.current = [];
     recognizerRef.current.clearTrail();
@@ -282,6 +303,7 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
     setTrail([]);
     trailRef.current = [];
     recognizerRef.current.clearTrail();
+    setTopProbability(null);
     setSegments([]);
     trainingAttemptStartRef.current = null;
     lastObservedTimeRef.current = null;
@@ -317,6 +339,28 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
     setSuccessCount(0);
     resetTrainingState(`Selected ${spell.displayName}. Draw the gesture to cast`);
   }, [clearTrainingResetTimer, resetTrainingState]);
+
+  const updateProbabilityFeedback = useCallback((path: Point[], frameLandmarks: TrackingFrame["landmarks"]) => {
+    const now = performance.now();
+    if (now - lastProbabilityAtRef.current < DEFAULT_PROBABILITY_REFRESH_MS) {
+      return;
+    }
+    lastProbabilityAtRef.current = now;
+
+    const ranked = evaluateSpellProbabilities(path, frameLandmarks, {
+      minStrokeLength: settings.detection.minimumGestureLength,
+      smoothingFactor: settings.detection.smoothingFactor,
+      minMovement: recognizerSettings.minMovement,
+      limit: 1,
+    });
+
+    const best = ranked[0];
+    if (!best || best.confidence < 0.12) {
+      setTopProbability(null);
+      return;
+    }
+    setTopProbability(best);
+  }, [recognizerSettings.minMovement, settings.detection.minimumGestureLength, settings.detection.smoothingFactor]);
 
   const toggleTrainingMode = useCallback(() => {
     const nextMode: TrainingModeState = currentTrainingMode === "LEARNING" ? "FREE" : "LEARNING";
@@ -356,8 +400,10 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
     lastObservedPointRef.current = null;
     lastObservedTimeRef.current = null;
     dropoutStartRef.current = null;
+    lastMousePointRef.current = null;
     setFeedback(null);
     setFlashProgress(0);
+    setTopProbability(null);
   }, []);
 
   const processHostCastEvent = useCallback((event: SpellCastEvent): boolean => {
@@ -642,8 +688,9 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
         setTrail((prev) => {
           const last = prev[prev.length - 1];
           if (!last || distance(last, point) >= 6) {
-            const next = [...prev, point].slice(-500);
+            const next = [...prev, point].slice(-settings.trail.trailLength);
             trailRef.current = next;
+            updateProbabilityFeedback(next, frameLandmarks);
             return next;
           }
           return prev;
@@ -662,6 +709,7 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
           setTrail([]);
           trailRef.current = [];
           recognizer.clearTrail();
+          setTopProbability(null);
           setSegments([]);
           setIsDrawing(false);
           playSpellTone(match.spell.soundFrequencies, match.spell.soundWave);
@@ -675,7 +723,7 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
         const currentTrail = recognizer.getTrail();
         if (currentTrail.length > 6) {
           const cleaned = filterByMinDistance(currentTrail, 5);
-          const smoothed = smoothPath(cleaned, 0.4);
+          const smoothed = smoothPath(cleaned, settings.detection.smoothingFactor);
           const segs = segmentPath(smoothed).slice(-6);
           setSegments(segs);
         } else {
@@ -698,9 +746,10 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
       let nextTrailRef = trailRef.current;
       const last = trailRef.current[trailRef.current.length - 1];
       if (!last || distance(last, point) >= 6) {
-        nextTrailRef = [...trailRef.current, point].slice(-500);
+        nextTrailRef = [...trailRef.current, point].slice(-settings.trail.trailLength);
         trailRef.current = nextTrailRef;
         setTrail(nextTrailRef);
+        updateProbabilityFeedback(nextTrailRef, frameLandmarks);
       }
 
       const liveConfidence = detectSpecificSpell(nextTrailRef, frameLandmarks);
@@ -716,7 +765,7 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
       lastSegmentComputeAtRef.current = pointTime;
       if (nextTrailRef.length > 6) {
         const cleaned = filterByMinDistance(nextTrailRef, 5);
-        const smoothed = smoothPath(cleaned, 0.4);
+        const smoothed = smoothPath(cleaned, settings.detection.smoothingFactor);
         const segs = segmentPath(smoothed).slice(-6);
         setSegments(segs);
       } else {
@@ -730,8 +779,9 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
     setTrail((prev) => {
       const last = prev[prev.length - 1];
       if (!last || distance(last, point) >= 6) {
-        const next = [...prev, point].slice(-500);
+        const next = [...prev, point].slice(-settings.trail.trailLength);
         trailRef.current = next;
+        updateProbabilityFeedback(next, frameLandmarks);
         return next;
       }
       return prev;
@@ -744,6 +794,7 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
       setTrail([]);
       trailRef.current = [];
       recognizer.clearTrail();
+      setTopProbability(null);
 
       if (multiplayerEnabled) {
         const eventTimestamp = Date.now();
@@ -783,7 +834,7 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
     const currentTrail = recognizer.getTrail();
     if (currentTrail.length > 6) {
       const cleaned = filterByMinDistance(currentTrail, 5);
-      const smoothed = smoothPath(cleaned, 0.4);
+      const smoothed = smoothPath(cleaned, settings.detection.smoothingFactor);
       const segs = segmentPath(smoothed).slice(-6);
       setSegments(segs);
     } else {
@@ -800,8 +851,11 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
     processHostCastEvent,
     role,
     selectedSpell,
+    settings.detection.smoothingFactor,
+    settings.trail.trailLength,
     showDebug,
     success,
+    updateProbabilityFeedback,
   ]);
 
   // ── Tracking frame handler (CV mode) ─────────────────────────────────────
@@ -834,7 +888,7 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
           && currentTrainingMode === "LEARNING"
           && isDrawing
           && dropoutStartRef.current !== null
-          && timestamp - dropoutStartRef.current > TRAINING_IDLE_END_MS
+          && timestamp - dropoutStartRef.current > settings.detection.gestureTimeoutMs
         ) {
           handleGestureEnd(trailRef.current, latestLandmarksRef.current);
           return;
@@ -875,7 +929,16 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
 
       processMotionPoint(point, frameLandmarks);
     },
-    [currentTrainingMode, detectionEnabled, handleGestureEnd, inputMode, isDrawing, isTrainingMode, processMotionPoint],
+    [
+      currentTrainingMode,
+      detectionEnabled,
+      handleGestureEnd,
+      inputMode,
+      isDrawing,
+      isTrainingMode,
+      processMotionPoint,
+      settings.detection.gestureTimeoutMs,
+    ],
   );
 
   useEffect(() => {
@@ -892,7 +955,7 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
       }
 
       const lastAt = lastObservedTimeRef.current;
-      if (lastAt !== null && now - lastAt > TRAINING_IDLE_END_MS) {
+      if (lastAt !== null && now - lastAt > settings.detection.gestureTimeoutMs) {
         handleGestureEnd(trailRef.current, latestLandmarksRef.current);
       }
     }, 120);
@@ -900,11 +963,19 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
     return () => {
       window.clearInterval(timer);
     };
-  }, [currentTrainingMode, detectionEnabled, failure, handleGestureEnd, isDrawing, isTrainingMode]);
+  }, [
+    currentTrainingMode,
+    detectionEnabled,
+    failure,
+    handleGestureEnd,
+    isDrawing,
+    isTrainingMode,
+    settings.detection.gestureTimeoutMs,
+  ]);
 
   // ── Tracking hook ────────────────────────────────────────────────────────
   const { videoRef, landmarks, cameraStream, gesture, fps, isReady, error, videoSize } =
-    useHandTracking(DEFAULT_TRACKING, handleTrackingFrame, inputMode === "CV");
+    useHandTracking(trackingSettings, handleTrackingFrame, inputMode === "CV");
 
   const localTrackingReady = inputMode === "MOUSE" ? true : isReady;
 
@@ -949,18 +1020,47 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
     const boundedX = Math.min(1, Math.max(0, nx));
     const boundedY = Math.min(1, Math.max(0, ny));
 
-    const rawX = boundedX * videoSize.width;
+    const scale = settings.input.mouse.speedScaling;
+    const centeredX = (boundedX - 0.5) * scale + 0.5;
+    const centeredY = (boundedY - 0.5) * scale + 0.5;
+
+    const scaledX = Math.min(1, Math.max(0, centeredX));
+    const scaledY = Math.min(1, Math.max(0, centeredY));
+
+    const rawX = scaledX * videoSize.width;
     const x = isMirrored ? videoSize.width - rawX : rawX;
+    const y = scaledY * videoSize.height;
+
+    const prevMouse = lastMousePointRef.current;
+    const alpha = 1 - settings.input.mouse.smoothing;
+    const smoothedPoint: Point = prevMouse
+      ? {
+        x: prevMouse.x + (x - prevMouse.x) * alpha,
+        y: prevMouse.y + (y - prevMouse.y) * alpha,
+        t: performance.now(),
+      }
+      : {
+        x,
+        y,
+        t: performance.now(),
+      };
+
+    lastMousePointRef.current = smoothedPoint;
 
     processMotionPoint(
-      {
-        x,
-        y: boundedY * videoSize.height,
-        t: performance.now(),
-      },
+      smoothedPoint,
       null,
     );
-  }, [detectionEnabled, inputMode, isMirrored, processMotionPoint, videoSize.height, videoSize.width]);
+  }, [
+    detectionEnabled,
+    inputMode,
+    isMirrored,
+    processMotionPoint,
+    settings.input.mouse.smoothing,
+    settings.input.mouse.speedScaling,
+    videoSize.height,
+    videoSize.width,
+  ]);
 
   const handleMouseLeave = useCallback(() => {
     if (!isTrainingMode || currentTrainingMode !== "LEARNING" || inputMode !== "MOUSE" || !isDrawing) {
@@ -994,12 +1094,20 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
 
   // ── Render path ──────────────────────────────────────────────────────────
   const renderPath = useMemo(() => {
-    const cleaned = filterByMinDistance(trail, 4);
-    return smoothPath(cleaned, 0.4);
-  }, [trail]);
+    const cleaned = filterByMinDistance(trail, Math.max(2, recognizerSettings.minMovement * 0.75));
+    return smoothPath(cleaned, settings.detection.smoothingFactor);
+  }, [recognizerSettings.minMovement, settings.detection.smoothingFactor, trail]);
 
   const activeSpellColor = feedback?.spell.color ?? null;
   const trainingAccuracy = attemptCount > 0 ? Math.round((successCount / attemptCount) * 100) : 0;
+  const handleSettingsChange = useCallback((next: DuelSettings) => {
+    const sanitized = sanitizeDuelSettings(next);
+    if (sanitized.input.mode !== settings.input.mode) {
+      lastMousePointRef.current = null;
+      setTopProbability(null);
+    }
+    setSettings(sanitized);
+  }, [settings.input.mode]);
 
   return (
     <div className="duel-root">
@@ -1035,6 +1143,8 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
                 showDebug={showDebug}
                 active={inputMode === "CV" ? Boolean(gesture.drawTip) : detectionEnabled}
                 trailColor={feedback ? feedback.spell.color : "#7de8ff"}
+                trailThickness={settings.trail.strokeThickness}
+                trailFadeDurationMs={settings.trail.fadeDurationMs}
                 spellColor={activeSpellColor}
                 spellFlashProgress={flashProgress}
                 segments={segments}
@@ -1101,6 +1211,28 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
 
             <div className="fps-badge">{fps} FPS</div>
 
+            {topProbability && !feedback && (
+              <div className="probability-badge">
+                Likely: {topProbability.spell.displayName} ({(topProbability.confidence * 100).toFixed(0)}%)
+              </div>
+            )}
+
+            <button
+              type="button"
+              onClick={() => setShowSettingsPanel((prev) => !prev)}
+              className="settings-fab"
+              aria-label="Toggle settings panel"
+              aria-expanded={showSettingsPanel}
+            >
+              ⚙
+            </button>
+
+            {showSettingsPanel && (
+              <div className="settings-popover" role="dialog" aria-label="Gesture settings">
+                <SettingsPanel settings={settings} onChange={handleSettingsChange} />
+              </div>
+            )}
+
             <div className="controls-bar">
               <button
                 type="button"
@@ -1115,20 +1247,6 @@ export function HandTracker({ mode = "solo", multiplayer }: HandTrackerProps) {
                 className={`btn-debug ${showDebug ? "btn-debug-on" : ""}`}
               >
                 Debug {showDebug ? "ON" : "OFF"}
-              </button>
-              <button
-                type="button"
-                onClick={() => setIsMirrored((v) => !v)}
-                className="btn-debug"
-              >
-                Mirror Camera: {isMirrored ? "ON" : "OFF"}
-              </button>
-              <button
-                type="button"
-                onClick={() => setInputMode((v) => (v === "CV" ? "MOUSE" : "CV"))}
-                className="btn-debug"
-              >
-                {inputMode === "CV" ? "Hand Tracking Mode" : "Mouse Casting Mode"}
               </button>
               <button
                 type="button"
