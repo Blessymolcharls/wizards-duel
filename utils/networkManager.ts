@@ -64,7 +64,7 @@ export const encodePeerMessage = (from: Role, payload: PeerEvent): string =>
 const isObject = (value: unknown): value is Record<string, unknown> =>
   Boolean(value) && typeof value === "object";
 
-const hasType = (value: unknown, type: PeerEvent["type"]): value is { type: typeof type } =>
+const hasType = <T extends string>(value: unknown, type: T): value is Record<string, unknown> & { type: T } =>
   isObject(value) && value.type === type;
 
 export const decodePeerMessage = (raw: string): PeerMessage | null => {
